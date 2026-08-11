@@ -1,0 +1,5 @@
+@import "tailwindcss";
+@theme { --color-ink: #14213d; --color-paraguay: #d62828; --color-sun: #fcbf49; }
+body { background:#f7f8fa; color:#14213d; font-family:Arial, sans-serif; }
+main { max-width:1180px; margin:auto; padding:2rem 1rem; }
+.card { background:white; border:1px solid #e5e7eb; border-radius:1rem; padding:1.25rem; box-shadow:0 1px 2px #00000008; }
