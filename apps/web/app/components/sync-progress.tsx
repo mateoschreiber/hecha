@@ -1,0 +1,4 @@
+"use client";
+import { useEffect, useState } from "react";
+type Progress={status:string;page:number;total_pages:number;added_or_modified:number};
+export function SyncProgress(){const [p,setP]=useState<Progress>();useEffect(()=>{const f=async()=>{try{setP((await (await fetch("/api/v1/sync/expedients/progress")).json()).data)}catch{}};f();const i=setInterval(f,5000);return()=>clearInterval(i)},[]);if(!p||p.status!=="running")return null;const n=Math.round(p.page/p.total_pages*100);return <div className="mt-3 rounded bg-blue-50 p-3 text-sm text-blue-950"><div className="flex justify-between"><b>Sincronizando SILpy</b><span>{n}% · página {p.page}/{p.total_pages}</span></div><div className="mt-2 h-2 overflow-hidden rounded bg-blue-100"><div className="h-full bg-paraguay" style={{width:`${n}%`}}/></div><p className="mt-1">Añadidos o modificados: {p.added_or_modified}</p></div>}

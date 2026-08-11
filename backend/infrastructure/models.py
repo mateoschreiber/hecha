@@ -27,6 +27,7 @@ class TimestampedSource(Base):
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     content_hash: Mapped[str] = mapped_column(String(64))
     raw_payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    search_document: Mapped[str] = mapped_column(Text, default="")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 

@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     silpy_partial_pages: int = 3
     silpy_timeout_seconds: float = 12.0
     silpy_max_attempts: int = 3
+    silpy_concurrency: int = 5
+    freshness_stale_minutes: int = 45
 
 
 @lru_cache

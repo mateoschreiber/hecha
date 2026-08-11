@@ -24,10 +24,10 @@ services:
     healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health/live')"], interval: 10s, timeout: 3s, retries: 5}
   worker:
     build: {context: ., dockerfile: apps/api/Dockerfile}
-    command: ["python", "-m", "apps.worker.main"]
+    command: ["python", "-m", "apps.worker.main", "--forever"]
     environment: ["DATABASE_URL=postgresql+psycopg://hecha:${POSTGRES_PASSWORD:-hecha}@db:5432/hecha", "REDIS_URL=redis://redis:6379/0"]
     depends_on: {db: {condition: service_healthy}, migrate: {condition: service_completed_successfully}}
-    networks: [internal]
+    networks: [internal, egress]
     restart: unless-stopped
   migrate:
     build: {context: ., dockerfile: apps/api/Dockerfile}
@@ -47,4 +47,4 @@ services:
     networks: [internal]
     healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 12}
 volumes: {postgres-data: {}}
-networks: {public: {}, internal: {internal: true}}
+networks: {public: {}, internal: {internal: true}, egress: {}}

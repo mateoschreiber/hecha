@@ -34,6 +34,7 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
         )
     )
     now = datetime.now(UTC)
+    author_names = [f"{author.nombres} {author.apellidos}".strip() for author in item.authors]
     values = {
         "number": item.number,
         "title": item.title,
@@ -47,6 +48,7 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
         "urgency": item.urgency,
         "filed_on": item.filed_on,
         "raw_payload": raw,
+        "search_document": " ".join(filter(None, [item.number, item.title, *author_names])),
         "content_hash": digest,
         "last_seen_at": now,
         "synced_at": now,
@@ -64,6 +66,8 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
         expedient.committees.clear()
         session.flush()
     else:
+        expedient.last_seen_at = now
+        expedient.synced_at = now
         return expedient
     for author in item.authors:
         expedient.authors.append(
@@ -94,10 +98,10 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
     return expedient
 
 
-def advance_checkpoint(session: Session, page: int) -> None:
-    checkpoint = session.get(SyncCheckpoint, "expedients")
+def advance_checkpoint(session: Session, page: int, resource: str = "expedients") -> None:
+    checkpoint = session.get(SyncCheckpoint, resource)
     if checkpoint is None:
-        session.add(SyncCheckpoint(resource="expedients", cursor=str(page)))
+        session.add(SyncCheckpoint(resource=resource, cursor=str(page)))
     else:
         checkpoint.cursor = str(page)
 
