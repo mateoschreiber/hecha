@@ -45,6 +45,7 @@ class Expedient(TimestampedSource):
     substage: Mapped[str | None] = mapped_column(String(256))
     urgency: Mapped[str | None] = mapped_column(String(64))
     filed_on: Mapped[date | None] = mapped_column(Date, index=True)
+    legislative_period: Mapped[str | None] = mapped_column(String(16), index=True)
     authors: Mapped[list[ExpedientAuthor]] = relationship(
         back_populates="expedient", cascade="all, delete-orphan"
     )
@@ -94,6 +95,14 @@ class SyncRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(32), default="running")
     processed_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_count: Mapped[int | None] = mapped_column(Integer)
+    created_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, default=0)
+    invalid_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
+    current_page: Mapped[int | None] = mapped_column(Integer)
+    last_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_summary: Mapped[str | None] = mapped_column(Text)
 
 
@@ -134,3 +143,62 @@ class OutboxEvent(Base):
     topic: Mapped[str] = mapped_column(String(128))
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SyncRequest(Base):
+    __tablename__ = "sync_requests"
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    resource: Mapped[str] = mapped_column(String(64), default="expedients")
+    period: Mapped[str] = mapped_column(String(16))
+    mode: Mapped[str] = mapped_column(String(32), default="refresh")
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    run_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True))
+    error_summary: Mapped[str | None] = mapped_column(Text)
+
+
+class Legislator(TimestampedSource):
+    __tablename__ = "legislators"
+    __table_args__ = (UniqueConstraint("source_system", "source_id", name="uq_legislators_source"),)
+    full_name: Mapped[str] = mapped_column(String(256))
+    chamber: Mapped[str | None] = mapped_column(String(128), index=True)
+    party: Mapped[str | None] = mapped_column(String(256))
+    caucus: Mapped[str | None] = mapped_column(String(256))
+    legislative_period: Mapped[str | None] = mapped_column(String(16), index=True)
+    profile_url: Mapped[str | None] = mapped_column(Text)
+
+
+class Commission(TimestampedSource):
+    __tablename__ = "commissions"
+    __table_args__ = (UniqueConstraint("source_system", "source_id", name="uq_commissions_source"),)
+    name: Mapped[str] = mapped_column(String(256))
+    chamber: Mapped[str | None] = mapped_column(String(128), index=True)
+    commission_type: Mapped[str | None] = mapped_column(String(128))
+    legislative_period: Mapped[str | None] = mapped_column(String(16), index=True)
+    source_url: Mapped[str | None] = mapped_column(Text)
+
+
+class LegislativeSession(TimestampedSource):
+    __tablename__ = "legislative_sessions"
+    __table_args__ = (UniqueConstraint("source_system", "source_id", name="uq_sessions_source"),)
+    title: Mapped[str] = mapped_column(Text)
+    chamber: Mapped[str | None] = mapped_column(String(128), index=True)
+    session_type: Mapped[str | None] = mapped_column(String(128))
+    held_on: Mapped[date | None] = mapped_column(Date, index=True)
+    legislative_period: Mapped[str | None] = mapped_column(String(16), index=True)
+    source_url: Mapped[str | None] = mapped_column(Text)
+
+
+class Vote(TimestampedSource):
+    __tablename__ = "votes"
+    __table_args__ = (UniqueConstraint("source_system", "source_id", name="uq_votes_source"),)
+    motion: Mapped[str] = mapped_column(Text)
+    result: Mapped[str | None] = mapped_column(String(128), index=True)
+    chamber: Mapped[str | None] = mapped_column(String(128), index=True)
+    voted_on: Mapped[date | None] = mapped_column(Date, index=True)
+    legislative_period: Mapped[str | None] = mapped_column(String(16), index=True)
+    session_source_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    expedient_source_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    source_url: Mapped[str | None] = mapped_column(Text)

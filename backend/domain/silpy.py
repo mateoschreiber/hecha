@@ -49,5 +49,9 @@ class SilpyExpedient(BaseModel):
         if value in (None, ""):
             return None
         if isinstance(value, date):
-            return value
-        return date.fromisoformat("-".join(reversed(str(value).split("/"))))
+            parsed = value
+        else:
+            parsed = date.fromisoformat("-".join(reversed(str(value).split("/"))))
+        if not 2007 <= parsed.year <= date.today().year + 1:
+            raise ValueError("fecha SILpy fuera de rango")
+        return parsed

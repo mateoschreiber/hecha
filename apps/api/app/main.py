@@ -9,7 +9,15 @@ from sqlalchemy.orm import Session, selectinload
 
 from backend.infrastructure.config import get_settings
 from backend.infrastructure.database import get_session
-from backend.infrastructure.models import Expedient, OutboxEvent, SyncCheckpoint, SyncRun
+from backend.infrastructure.models import (
+    Commission,
+    Expedient,
+    LegislativeSession,
+    Legislator,
+    SyncRequest,
+    SyncRun,
+    Vote,
+)
 
 app = FastAPI(title="Hecha API", version="0.1.0", openapi_url="/api/v1/openapi.json", docs_url=None)
 GOVERNMENT_PERIODS = {
@@ -17,6 +25,7 @@ GOVERNMENT_PERIODS = {
     "2023-2028": (date(2023, 7, 1), date(2028, 6, 30)),
 }
 CURRENT_PERIOD = "2023-2028"
+PUBLIC_SYNC_COOLDOWN = timedelta(minutes=5)
 
 
 def result(data: object, meta: dict[str, object] | None = None) -> dict[str, object]:
@@ -91,32 +100,112 @@ def freshness(session: Session = Depends(get_session)) -> dict[str, object]:
     )
 
 
-@app.post("/api/v1/sync/expedients/missing", status_code=status.HTTP_202_ACCEPTED)
-def request_missing_expedients_sync(session: Session = Depends(get_session)) -> dict[str, object]:
-    """Queue a worker-only reconciliation that fetches details only for missing IDs."""
-    topic = "sync.expedients.missing.requested"
-    pending = session.scalar(
-        select(OutboxEvent).where(OutboxEvent.topic == topic, OutboxEvent.processed_at.is_(None))
+@app.post("/api/v1/sync/expedients", status_code=status.HTTP_202_ACCEPTED)
+def request_expedients_sync(
+    period: str = CURRENT_PERIOD, session: Session = Depends(get_session)
+) -> dict[str, object]:
+    if period not in GOVERNMENT_PERIODS:
+        raise HTTPException(422, detail={"code": "invalid_period", "message": "Período inválido"})
+    active = session.scalar(
+        select(SyncRequest).where(
+            SyncRequest.resource == "expedients",
+            SyncRequest.period == period,
+            SyncRequest.status.in_(("queued", "running")),
+        )
     )
-    if pending is None:
-        session.add(OutboxEvent(topic=topic, payload={"requested_by": "public_portal"}))
-        session.commit()
-        return result({"status": "queued"})
-    return result({"status": "already_queued"})
+    if active:
+        return result({"status": active.status, "request_id": str(active.id)})
+    request = SyncRequest(period=period, mode="refresh", status="queued")
+    session.add(request)
+    session.commit()
+    return result({"status": "queued", "request_id": str(request.id)})
+
+
+@app.post("/api/v1/sync", status_code=status.HTTP_202_ACCEPTED)
+def request_public_sync(session: Session = Depends(get_session)) -> dict[str, object]:
+    """Queue the single public refresh; never invokes SILpy during a visitor request."""
+    active = session.scalar(
+        select(SyncRequest).where(
+            SyncRequest.resource == "public_data", SyncRequest.status.in_(("queued", "running"))
+        )
+    )
+    if active:
+        return result({"status": active.status, "request_id": str(active.id), "deduplicated": True})
+    recent = session.scalar(
+        select(SyncRequest)
+        .where(SyncRequest.resource == "public_data", SyncRequest.status == "completed")
+        .order_by(SyncRequest.finished_at.desc())
+    )
+    if (
+        recent
+        and recent.finished_at
+        and datetime.now(UTC) - recent.finished_at < PUBLIC_SYNC_COOLDOWN
+    ):
+        return result(
+            {
+                "status": "cooldown",
+                "request_id": str(recent.id),
+                "retry_at": recent.finished_at + PUBLIC_SYNC_COOLDOWN,
+            }
+        )
+    request = SyncRequest(resource="public_data", period="all", mode="refresh", status="queued")
+    session.add(request)
+    session.commit()
+    return result({"status": "queued", "request_id": str(request.id), "deduplicated": False})
 
 
 @app.get("/api/v1/sync/expedients/progress")
 def sync_progress(session: Session = Depends(get_session)) -> dict[str, object]:
-    run = session.scalar(
-        select(SyncRun).where(SyncRun.status == "running").order_by(SyncRun.started_at.desc())
-    )
-    cursor = session.get(SyncCheckpoint, "expedients")
-    processed = run.processed_count if run else 0
+    run = session.scalar(select(SyncRun).order_by(SyncRun.started_at.desc()))
+    if not run:
+        return result({"status": "idle"})
     return result(
-        {"status": run.status if run else "idle",
-         "page": int(cursor.cursor or "0") if cursor else 0,
-         "total_pages": 501, "processed": processed, "added_or_modified": processed}
+        {
+            "status": run.status,
+            "page": run.current_page,
+            "total": run.total_count,
+            "processed": run.processed_count,
+            "added": run.created_count,
+            "modified": run.updated_count,
+            "skipped": run.skipped_count,
+            "invalid": run.invalid_count,
+            "failed": run.failed_count,
+            "updated_at": run.last_progress_at,
+        }
     )
+
+
+@app.get("/api/v1/sync/progress")
+def public_sync_progress(session: Session = Depends(get_session)) -> dict[str, object]:
+    request = session.scalar(
+        select(SyncRequest)
+        .where(SyncRequest.resource == "public_data")
+        .order_by(SyncRequest.created_at.desc())
+    )
+    if not request:
+        return result({"status": "idle", "entity": None})
+    run = session.get(SyncRun, request.run_id) if request.run_id else None
+    progress: dict[str, object] = {
+        "status": request.status,
+        "entity": "expedients",
+        "phase": request.mode,
+        "last_error": request.error_summary,
+        "started_at": request.started_at,
+        "finished_at": request.finished_at,
+    }
+    if run:
+        progress |= {
+            "range": run.current_page,
+            "total_ranges": run.total_count,
+            "processed": run.processed_count,
+            "created": run.created_count,
+            "modified": run.updated_count,
+            "skipped": run.skipped_count,
+            "invalid": run.invalid_count,
+            "failed": run.failed_count,
+            "updated_at": run.last_progress_at,
+        }
+    return result(progress)
 
 
 @app.get("/api/v1/expedients")
@@ -136,7 +225,9 @@ def list_expedients(
     stmt = select(Expedient).where(Expedient.is_active.is_(True))
     if period != "all":
         if period not in GOVERNMENT_PERIODS:
-            raise HTTPException(422, detail={"code": "invalid_period", "message": "Periodo invalido"})
+            raise HTTPException(
+                422, detail={"code": "invalid_period", "message": "Período inválido"}
+            )
         period_from, period_to = GOVERNMENT_PERIODS[period]
         stmt = stmt.where(Expedient.filed_on.between(period_from, period_to))
     if q:
@@ -171,6 +262,33 @@ def list_expedients(
     return result([serialize(row) for row in rows], {"page": page, "limit": limit, "total": total})
 
 
+@app.get("/api/v1/expedients/suggest")
+def suggest_expedients(
+    q: str = Query(min_length=1, max_length=120),
+    period: str = CURRENT_PERIOD,
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    """Lightweight, stable autocomplete for number, title and indexed author text."""
+    if period != "all" and period not in GOVERNMENT_PERIODS:
+        raise HTTPException(422, detail={"code": "invalid_period", "message": "Período inválido"})
+    stmt = select(Expedient).where(
+        Expedient.is_active.is_(True),
+        or_(
+            Expedient.number.ilike(f"%{q}%"),
+            Expedient.title.ilike(f"%{q}%"),
+            Expedient.search_document.ilike(f"%{q}%"),
+        ),
+    )
+    if period != "all":
+        stmt = stmt.where(Expedient.filed_on.between(*GOVERNMENT_PERIODS[period]))
+    rows = session.scalars(
+        stmt.order_by(Expedient.filed_on.desc().nullslast(), Expedient.id).limit(10)
+    ).all()
+    return result(
+        [{"source_id": row.source_id, "number": row.number, "title": row.title} for row in rows]
+    )
+
+
 @app.get("/api/v1/expedients/{id_or_number}")
 def detail(id_or_number: str, session: Session = Depends(get_session)) -> dict[str, object]:
     stmt = (
@@ -193,7 +311,8 @@ def detail(id_or_number: str, session: Session = Depends(get_session)) -> dict[s
 @app.get("/api/v1/search")
 def search(
     q: str = Query(min_length=1, max_length=120),
-    period: str = CURRENT_PERIOD, session: Session = Depends(get_session)
+    period: str = CURRENT_PERIOD,
+    session: Session = Depends(get_session),
 ) -> dict[str, object]:
     return list_expedients(
         q=q,
@@ -237,14 +356,15 @@ def dashboard_summary(
         .order_by("month")
     ).all()
     total = session.scalar(select(func.count()).select_from(base)) or 0
-    in_progress = session.scalar(
-        select(func.count()).select_from(base).where(base.c.status == "EN TRAMITE")
-    ) or 0
+    in_progress = (
+        session.scalar(select(func.count()).select_from(base).where(base.c.status == "EN TRAMITE"))
+        or 0
+    )
     recent = session.scalars(
         select(Expedient)
         .where(*conditions)
         .order_by(Expedient.filed_on.desc().nullslast(), Expedient.id)
-        .limit(6)
+        .limit(3)
     ).all()
     return result(
         {
@@ -256,6 +376,94 @@ def dashboard_summary(
             "recent": [serialize(item) for item in recent],
         }
     )
+
+
+def public_listing(
+    model: Any,
+    period: str,
+    page: int,
+    limit: int,
+    session: Session,
+    date_column: Any,
+    title_column: Any,
+) -> dict[str, object]:
+    if period != "all" and period not in GOVERNMENT_PERIODS:
+        raise HTTPException(422, detail={"code": "invalid_period", "message": "Período inválido"})
+    stmt = select(model).where(model.is_active.is_(True))
+    if period != "all":
+        stmt = stmt.where(model.legislative_period == period)
+    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = session.scalars(
+        stmt.order_by(date_column.desc().nullslast(), model.id)
+        .offset((page - 1) * limit)
+        .limit(limit)
+    ).all()
+    return result(
+        [
+            {
+                "id": str(row.id),
+                "source_id": row.source_id,
+                "title": getattr(row, title_column.key),
+                "chamber": row.chamber,
+                "period": row.legislative_period,
+                "source_url": getattr(row, "source_url", None) or getattr(row, "profile_url", None),
+            }
+            for row in rows
+        ],
+        {"page": page, "limit": limit, "total": total},
+    )
+
+
+@app.get("/api/v1/legislators")
+def list_legislators(
+    period: str = CURRENT_PERIOD,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    return public_listing(
+        Legislator, period, page, limit, session, Legislator.synced_at, Legislator.full_name
+    )
+
+
+@app.get("/api/v1/commissions")
+def list_commissions(
+    period: str = CURRENT_PERIOD,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    return public_listing(
+        Commission, period, page, limit, session, Commission.synced_at, Commission.name
+    )
+
+
+@app.get("/api/v1/sessions")
+def list_sessions(
+    period: str = CURRENT_PERIOD,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    return public_listing(
+        LegislativeSession,
+        period,
+        page,
+        limit,
+        session,
+        LegislativeSession.held_on,
+        LegislativeSession.title,
+    )
+
+
+@app.get("/api/v1/votes")
+def list_votes(
+    period: str = CURRENT_PERIOD,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=50),
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
+    return public_listing(Vote, period, page, limit, session, Vote.voted_on, Vote.motion)
 
 
 @app.get("/api/v1/catalogs/{name}")

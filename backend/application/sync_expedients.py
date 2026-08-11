@@ -13,8 +13,6 @@ from backend.infrastructure.models import (
     CommitteeAssignment,
     Expedient,
     ExpedientAuthor,
-    OutboxEvent,
-    SyncCheckpoint,
     SyncItemFailed,
 )
 
@@ -47,6 +45,13 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
         "substage": item.substage,
         "urgency": item.urgency,
         "filed_on": item.filed_on,
+        "legislative_period": (
+            "2023-2028"
+            if item.filed_on and item.filed_on >= datetime(2023, 7, 1).date()
+            else "2018-2023"
+            if item.filed_on and item.filed_on >= datetime(2018, 7, 1).date()
+            else None
+        ),
         "raw_payload": raw,
         "search_document": " ".join(filter(None, [item.number, item.title, *author_names])),
         "content_hash": digest,
@@ -92,18 +97,7 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
             clean = name.strip(" 0123456789.(")
             if clean:
                 expedient.committees.append(CommitteeAssignment(name=clean))
-    session.add(
-        OutboxEvent(topic="expedient.changed", payload={"source_id": str(item.id_proyecto)})
-    )
     return expedient
-
-
-def advance_checkpoint(session: Session, page: int, resource: str = "expedients") -> None:
-    checkpoint = session.get(SyncCheckpoint, resource)
-    if checkpoint is None:
-        session.add(SyncCheckpoint(resource=resource, cursor=str(page)))
-    else:
-        checkpoint.cursor = str(page)
 
 
 def quarantine(
