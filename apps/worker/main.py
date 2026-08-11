@@ -2,25 +2,73 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
-from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
+from uuid import UUID
 
+import httpx
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from backend.application.sync_expedients import advance_checkpoint, persist_expedient, quarantine
-from backend.domain.silpy import SilpyExpedient
-from backend.infrastructure.config import get_settings
+from backend.application.sync_expedients import payload_hash, persist_expedient, quarantine
 from backend.infrastructure.database import SessionLocal
-from backend.infrastructure.models import Expedient, OutboxEvent, SyncCheckpoint, SyncRun
-from backend.infrastructure.silpy_client import SilpyClient, SilpyUnavailable
+from backend.infrastructure.models import (
+    Commission,
+    Expedient,
+    LegislativeSession,
+    Legislator,
+    SyncRequest,
+    SyncRun,
+    Vote,
+)
+from backend.infrastructure.silpy_portal_client import SilpyPortalClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 LOCK_KEY = 348_821_447
-ASUNCION = ZoneInfo("America/Asuncion")
-MISSING_SYNC_TOPIC = "sync.expedients.missing.requested"
+
+
+def persist_public_rows(
+    model: type[Legislator] | type[Commission] | type[LegislativeSession] | type[Vote],
+    rows: list[dict[str, object]],
+) -> int:
+    """Idempotently persist lightweight public SILpy lists without private fields."""
+    now = datetime.now(UTC)
+    saved = 0
+    with SessionLocal() as session:
+        for row in rows:
+            raw = json.loads(json.dumps(row, default=str))
+            source_id = str(row["source_id"])
+            digest = payload_hash(raw)
+            existing = session.scalar(
+                select(model).where(model.source_system == "silpy", model.source_id == source_id)
+            )
+            values = {
+                **{key: value for key, value in row.items() if key != "source_id"},
+                "source_system": "silpy",
+                "source_id": source_id,
+                "content_hash": digest,
+                "raw_payload": raw,
+                "search_document": " ".join(str(value) for value in row.values() if value),
+                "last_seen_at": now,
+                "synced_at": now,
+                "is_active": True,
+            }
+            values.setdefault("legislative_period", "2023-2028")
+            values.setdefault("chamber", None)
+            if existing is None:
+                session.add(model(**values))
+                saved += 1
+            elif existing.content_hash != digest:
+                for key, value in values.items():
+                    setattr(existing, key, value)
+                saved += 1
+            else:
+                existing.last_seen_at = now
+                existing.synced_at = now
+        session.commit()
+    return saved
 
 
 def acquire_lock() -> Session | None:
@@ -38,177 +86,170 @@ def release_lock(session: Session) -> None:
     session.close()
 
 
-async def fetch_detail(client: SilpyClient, source_id: int) -> SilpyExpedient:
-    return await client.get_expedient(source_id)
-
-
-async def sync(mode: str = "partial", resume: bool = False) -> int | None:
-    """Synchronize SILpy without making public requests depend on the source."""
-    settings = get_settings()
-    full = mode in {"full", "seed", "missing"}
+async def sync_portal(period: str, request_id: UUID | None = None) -> UUID | None:
+    """Persist one current-portal sync request in committed monthly batches."""
     lock_session = acquire_lock()
     if lock_session is None:
         log.info("expedient sync skipped: another run owns the lock")
         return None
-    client = SilpyClient(settings)
+    client = SilpyPortalClient()
     try:
-        await client.open()
+        ranges = client.ranges(period)
         with SessionLocal() as session:
-            checkpoint_resource = "expedients_missing" if mode == "missing" else "expedients"
-            checkpoint = session.get(SyncCheckpoint, checkpoint_resource)
-            if full and not resume:
-                start = 1
-            else:
-                start = int(checkpoint.cursor or "0") + 1 if checkpoint else 1
-            run = SyncRun(resource="expedients", status="running", processed_count=0)
+            run = SyncRun(
+                resource="expedients",
+                status="running",
+                processed_count=0,
+                total_count=len(ranges),
+                current_page=0,
+                last_progress_at=datetime.now(UTC),
+            )
             session.add(run)
+            session.flush()
+            run_id = run.id
+            if request_id:
+                request = session.get(SyncRequest, request_id)
+                if request:
+                    request.run_id = run_id
             session.commit()
-            processed = 0
-            page = start
-            try:
-                while True:
-                    raw_rows = await client.list_expedients(page)
-                    if not raw_rows:
-                        if not full:
-                            advance_checkpoint(session, 0)
-                            session.commit()
-                        break
-                    summaries: list[SilpyExpedient] = []
-                    for raw in raw_rows:
+
+        if request_id:
+            sessions, votes, legislators, commissions = await asyncio.gather(
+                client.list_sessions(),
+                client.list_votes(),
+                client.list_legislators(),
+                client.list_commission_meetings(),
+            )
+            persist_public_rows(LegislativeSession, sessions)
+            persist_public_rows(Vote, votes)
+            persist_public_rows(Legislator, legislators)
+            persist_public_rows(Commission, commissions)
+
+        async with httpx.AsyncClient(
+            base_url="https://silpy.congreso.gov.py", timeout=20, follow_redirects=True
+        ) as http_client:
+            for page, (since, until) in enumerate(ranges, start=1):
+                records = await client.list_range(http_client, since, until)
+                created = updated = skipped = invalid = failed = 0
+                with SessionLocal() as session:
+                    for record in records:
                         try:
-                            summaries.append(SilpyExpedient.model_validate(raw))
-                        except Exception as error:
-                            payload = raw if isinstance(raw, dict) else {"invalid_item": raw}
-                            source_id = (
-                                str(raw.get("idProyecto")) if isinstance(raw, dict) else None
-                            )
-                            quarantine(session, source_id, payload, str(error))
-                    if mode == "missing" and summaries:
-                        existing_ids = set(
-                            session.scalars(
-                                select(Expedient.source_id).where(
+                            existing = session.scalar(
+                                select(Expedient).where(
                                     Expedient.source_system == "silpy",
-                                    Expedient.source_id.in_(
-                                        [str(summary.id_proyecto) for summary in summaries]
-                                    ),
+                                    Expedient.source_id == str(record.id_proyecto),
                                 )
-                            ).all()
-                        )
-                        summaries = [
-                            summary
-                            for summary in summaries
-                            if str(summary.id_proyecto) not in existing_ids
-                        ]
-                    details = await asyncio.gather(
-                        *(fetch_detail(client, summary.id_proyecto) for summary in summaries),
-                        return_exceptions=True,
-                    )
-                    for summary, detail in zip(summaries, details, strict=True):
-                        if isinstance(detail, BaseException):
-                            quarantine(
-                                session,
-                                str(summary.id_proyecto),
-                                summary.model_dump(by_alias=True),
-                                str(detail),
                             )
-                            continue
-                        try:
-                            with session.begin_nested():
-                                persist_expedient(session, detail)
-                            processed += 1
+                            old_hash = existing.content_hash if existing else None
+                            persist_expedient(session, record)
+                            if existing is None:
+                                created += 1
+                            elif old_hash == existing.content_hash:
+                                skipped += 1
+                            else:
+                                updated += 1
                         except Exception as error:
+                            failed += 1
                             quarantine(
                                 session,
-                                str(summary.id_proyecto),
-                                summary.model_dump(by_alias=True),
+                                str(record.id_proyecto),
+                                record.model_dump(by_alias=True, mode="json"),
                                 str(error),
                             )
-                    session.commit()  # persist/quarantine batch before moving its checkpoint
-                    advance_checkpoint(session, page, checkpoint_resource)
-                    session.commit()
-                    log.info(
-                        "expedient sync progress mode=%s page=%s processed=%s",
-                        mode,
-                        page,
-                        processed,
-                    )
-                    if not full and page - start + 1 >= settings.silpy_partial_pages:
-                        break
-                    page += 1
-                run.status = "completed"
-                run.processed_count = processed
-                run.finished_at = datetime.now(UTC)
-                session.commit()
+                    progress_run = session.get(SyncRun, run_id)
+                    assert progress_run is not None
+                    progress_run.current_page = page
+                    progress_run.processed_count += len(records)
+                    progress_run.created_count += created
+                    progress_run.updated_count += updated
+                    progress_run.skipped_count += skipped
+                    progress_run.invalid_count += invalid
+                    progress_run.failed_count += failed
+                    progress_run.last_progress_at = datetime.now(UTC)
+                    session.commit()  # progress only advances with a persisted range
                 log.info(
-                    "expedient sync completed mode=%s start_page=%s processed=%s",
-                    mode,
-                    start,
-                    processed,
+                    "SILpy portal sync period=%s range=%s..%s records=%s",
+                    period,
+                    since,
+                    until,
+                    len(records),
                 )
-                return processed
-            except SilpyUnavailable as error:
-                run.status = "failed"
-                run.error_summary = str(error)
-                run.finished_at = datetime.now(UTC)
-                session.commit()
-                raise
+
+        with SessionLocal() as session:
+            completed_run = session.get(SyncRun, run_id)
+            assert completed_run is not None
+            completed_run.status = "completed"
+            completed_run.finished_at = datetime.now(UTC)
+            completed_run.last_progress_at = completed_run.finished_at
+            session.commit()
+        return run_id
+    except Exception as error:
+        log.exception("SILpy portal sync failed")
+        if "run_id" in locals():
+            with SessionLocal() as session:
+                failed_run = session.get(SyncRun, run_id)
+                if failed_run:
+                    failed_run.status = "failed"
+                    failed_run.error_summary = str(error)[:1000]
+                    failed_run.finished_at = datetime.now(UTC)
+                    failed_run.last_progress_at = failed_run.finished_at
+                    session.commit()
+        raise
     finally:
-        await client.close()
         release_lock(lock_session)
 
 
 async def forever() -> None:
-    last_full_date: date | None = None
-    next_partial_at: datetime | None = None
+    """An idle worker only acts on an explicit queued request."""
     while True:
-        local_now = datetime.now(ASUNCION)
+        request_id: UUID | None = None
+        period: str | None = None
         try:
             with SessionLocal() as session:
                 requested = session.scalar(
-                    select(OutboxEvent)
+                    select(SyncRequest)
                     .where(
-                        OutboxEvent.topic == MISSING_SYNC_TOPIC,
-                        OutboxEvent.processed_at.is_(None),
+                        SyncRequest.resource.in_(("expedients", "public_data")),
+                        SyncRequest.status == "queued",
                     )
-                    .order_by(OutboxEvent.id)
+                    .order_by(SyncRequest.created_at)
                     .limit(1)
                 )
-                request_id = requested.id if requested else None
-            if request_id:
-                processed = await sync("missing")
-                if processed is not None:
-                    with SessionLocal() as session:
-                        event = session.get(OutboxEvent, request_id)
-                        if event:
-                            event.processed_at = datetime.now(UTC)
-                            session.commit()
-            elif (
-                local_now.hour == 2
-                and local_now.minute >= 15
-                and last_full_date != local_now.date()
-            ):
-                await sync("full")
-                last_full_date = local_now.date()
-            elif next_partial_at is None or datetime.now(UTC) >= next_partial_at:
-                await sync("partial")
-                next_partial_at = datetime.now(UTC) + timedelta(minutes=15)
+                if requested:
+                    requested.status = "running"
+                    requested.started_at = datetime.now(UTC)
+                    request_id = requested.id
+                    period = "2023-2028" if requested.period == "all" else requested.period
+                    session.commit()
+            if request_id and period:
+                error_summary: str | None = None
+                try:
+                    run_id = await sync_portal(period, request_id)
+                    request_status = "completed"
+                except Exception as exc:
+                    run_id, request_status = None, "failed"
+                    error_summary = str(exc)[:1000]
+                with SessionLocal() as session:
+                    request = session.get(SyncRequest, request_id)
+                    if request:
+                        request.status = request_status
+                        request.finished_at = datetime.now(UTC)
+                        request.error_summary = error_summary
+                        if run_id:
+                            request.run_id = run_id
+                        session.commit()
         except Exception:
-            log.exception("expedient sync failed")
+            log.exception("expedient worker loop failed")
         await asyncio.sleep(30)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Synchronize SILpy expedients")
-    parser.add_argument("--mode", choices=("partial", "full", "seed"), default="partial")
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="continue a full or seed run from the committed checkpoint",
-    )
-    parser.add_argument("--forever", action="store_true", help="run the scheduled worker loop")
+    parser = argparse.ArgumentParser(description="Synchronize current SILpy portal expedients")
+    parser.add_argument("--period", default="2023-2028", choices=("2018-2023", "2023-2028"))
+    parser.add_argument("--forever", action="store_true", help="process explicitly queued requests")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(forever() if args.forever else sync(args.mode, resume=args.resume))
+    asyncio.run(forever() if args.forever else sync_portal(args.period))

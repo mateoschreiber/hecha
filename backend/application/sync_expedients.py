@@ -63,7 +63,11 @@ def persist_expedient(session: Session, item: SilpyExpedient) -> Expedient:
         expedient = Expedient(source_system="silpy", source_id=str(item.id_proyecto), **values)
         session.add(expedient)
         session.flush()
-    elif expedient.content_hash != digest:
+    elif expedient.content_hash != digest or any(
+        getattr(expedient, key) != value
+        for key, value in values.items()
+        if key not in {"raw_payload", "content_hash", "last_seen_at", "synced_at"}
+    ):
         for key, value in values.items():
             setattr(expedient, key, value)
         expedient.authors.clear()

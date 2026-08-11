@@ -467,7 +467,11 @@ def list_votes(
 
 
 @app.get("/api/v1/catalogs/{name}")
-def catalogs(name: str, session: Session = Depends(get_session)) -> dict[str, object]:
+def catalogs(
+    name: str,
+    period: str = CURRENT_PERIOD,
+    session: Session = Depends(get_session),
+) -> dict[str, object]:
     fields = {
         "chambers": Expedient.chamber,
         "statuses": Expedient.status,
@@ -477,7 +481,10 @@ def catalogs(name: str, session: Session = Depends(get_session)) -> dict[str, ob
         raise HTTPException(
             404, detail={"code": "catalog_not_found", "message": "Catálogo no encontrado"}
         )
-    values = session.scalars(
-        select(fields[name]).where(fields[name].is_not(None)).distinct().order_by(fields[name])
-    ).all()
+    if period != "all" and period not in GOVERNMENT_PERIODS:
+        raise HTTPException(422, detail={"code": "invalid_period", "message": "Período inválido"})
+    statement = select(fields[name]).where(Expedient.is_active.is_(True), fields[name].is_not(None))
+    if period != "all":
+        statement = statement.where(Expedient.filed_on.between(*GOVERNMENT_PERIODS[period]))
+    values = session.scalars(statement.distinct().order_by(fields[name])).all()
     return result(values)

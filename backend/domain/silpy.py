@@ -1,9 +1,49 @@
 from __future__ import annotations
 
+import unicodedata
 from datetime import date
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def normalize_text(value: str | None) -> str | None:
+    """Normalize public SILpy labels without changing their meaning.
+
+    SILpy returns the same labels with inconsistent casing, accents and whitespace.
+    Keeping a single canonical value is essential because these fields power filters,
+    catalogues and dashboard aggregates.
+    """
+    if value is None:
+        return None
+    cleaned = " ".join(value.split())
+    return cleaned or None
+
+
+def normalize_label(value: str | None) -> str | None:
+    cleaned = normalize_text(value)
+    if cleaned is None:
+        return None
+    return unicodedata.normalize("NFKD", cleaned).encode("ascii", "ignore").decode().upper()
+
+
+def normalize_chamber(value: str | None) -> str | None:
+    label = normalize_label(value)
+    if label is None:
+        return None
+    if "DIPUT" in label:
+        return "CAMARA DE DIPUTADOS"
+    if "SENAD" in label:
+        return "CAMARA DE SENADORES"
+    return label
+
+
+def normalize_status(value: str | None) -> str | None:
+    return normalize_label(value)
+
+
+def normalize_project_type(value: str | None) -> str | None:
+    return normalize_label(value)
 
 
 class SilpyAuthor(BaseModel):
@@ -55,3 +95,24 @@ class SilpyExpedient(BaseModel):
         if not 2007 <= parsed.year <= date.today().year + 1:
             raise ValueError("fecha SILpy fuera de rango")
         return parsed
+
+    @field_validator(
+        "number", "title", "source_url", "initiative", "stage", "substage", "urgency", mode="before"
+    )
+    @classmethod
+    def normalize_public_text(cls, value: Any) -> str | None:
+        return normalize_text(str(value)) if value is not None else None
+
+    @field_validator("chamber", mode="before")
+    @classmethod
+    def normalize_public_chamber(cls, value: Any) -> str | None:
+        return normalize_chamber(str(value)) if value is not None else None
+
+    @field_validator("status", "project_type", mode="before")
+    @classmethod
+    def normalize_public_labels(cls, value: Any, info: Any) -> str | None:
+        if value is None:
+            return None
+        if info.field_name == "status":
+            return normalize_status(str(value))
+        return normalize_project_type(str(value))
