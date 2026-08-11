@@ -5,6 +5,7 @@ import pytest
 
 from backend.application.sync_expedients import payload_hash
 from backend.domain.silpy import SilpyExpedient
+from backend.infrastructure.silpy_portal_client import SilpyPortalClient
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "silpy"
 
@@ -27,3 +28,19 @@ def test_invalid_date_is_quarantinable() -> None:
         SilpyExpedient.model_validate(
             {"idProyecto": 1, "acapite": "x", "fechaIngresoExpediente": "bad"}
         )
+
+
+def test_portal_detail_parser_extracts_public_relations() -> None:
+    document = """
+    <div id="formMain:tabDetalle:tabDocumentos"><span class="textCourier"> LEY.pdf</span>
+    <span class="textoFileSize">2 MB</span>
+    https://silpy.congreso.gov.py/web/descarga/expediente-77</div>
+    <div id="formMain:tabDetalle:tabAutores"><a href="/web/legislador/42">Ana Pérez</a>
+    <span class="font-italic">ANR</span></div>
+    <div id="formMain:tabDetalle:tabEvolucion"></div>
+    """
+    detail = SilpyPortalClient()._parse_detail(document)
+    assert detail["listaAutores"] == [
+        {"idParlamentario": 42, "nombres": "Ana Pérez", "apellidos": "", "partidoPolitico": "ANR"}
+    ]
+    assert detail["archivosAdjuntos"][0]["infoAdjunto"] == "LEY.pdf · 2 MB"

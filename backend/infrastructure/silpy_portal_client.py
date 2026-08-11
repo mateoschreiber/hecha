@@ -112,6 +112,19 @@ class SilpyPortalClient:
                 records.extend(await self.list_range(client, since, until))
             return records
 
+    async def enrich_expedient(
+        self, client: httpx.AsyncClient, item: SilpyExpedient
+    ) -> SilpyExpedient:
+        """Merge authors and public documents from SILpy's detail page.
+
+        The advanced search intentionally omits these relations. This method is
+        invoked by the worker only, never from a visitor request.
+        """
+        response = await client.get(f"/web/expediente/{item.id_proyecto}")
+        response.raise_for_status()
+        payload = item.model_dump(by_alias=True, mode="json") | self._parse_detail(response.text)
+        return SilpyExpedient.model_validate(payload)
+
     async def list_sessions(self) -> list[dict[str, object]]:
         async with httpx.AsyncClient(
             base_url=BASE_URL, timeout=self.timeout, follow_redirects=True
@@ -243,3 +256,49 @@ class SilpyPortalClient:
             except ValueError:
                 continue
         return items
+
+    @staticmethod
+    def _section(document: str, section_id: str) -> str:
+        match = re.search(
+            rf'<div id="formMain:tabDetalle:{section_id}".*?'
+            r'(?=<div id="formMain:tabDetalle:tab(?:Autores|Evolucion)"'
+            r'|<input id="formMain:tabDetalle_activeIndex")',
+            document,
+            re.DOTALL,
+        )
+        return match.group(0) if match else ""
+
+    def _parse_detail(self, document: str) -> dict[str, object]:
+        authors: list[dict[str, object]] = []
+        authors_section = self._section(document, "tabAutores")
+        author_pattern = r'/web/legislador/(\d+)"[^>]*>(.*?)</a>.*?font-italic[^>]*>(.*?)</span>'
+        for source_id, name, party in re.findall(author_pattern, authors_section, re.DOTALL):
+            authors.append(
+                {
+                    "idParlamentario": int(source_id),
+                    "nombres": _text(name),
+                    "apellidos": "",
+                    "partidoPolitico": _text(party),
+                }
+            )
+
+        attachments: list[dict[str, object]] = []
+        documents_section = self._section(document, "tabDocumentos")
+        attachment_pattern = (
+            r'textCourier[^>]*>\s*(.*?)</span>(.{0,2500}?)'
+            r'https?://silpy\.congreso\.gov\.py/web/descarga/expediente-(\d+)'
+        )
+        for filename, fragment, source_id in re.findall(
+            attachment_pattern, documents_section, re.DOTALL
+        ):
+            size = re.search(r'textoFileSize[^>]*>(.*?)</span>', fragment, re.DOTALL)
+            parts = [_text(filename), *([_text(size.group(1))] if size else [])]
+            attachments.append(
+                {
+                    "idAdjunto": int(source_id),
+                    "appURL": f"{BASE_URL}/web/descarga/expediente-{source_id}",
+                    "infoAdjunto": " · ".join(parts) or "Documento de iniciativa",
+                    "tipoArchivo": "application/pdf",
+                }
+            )
+        return {"listaAutores": authors, "archivosAdjuntos": attachments}

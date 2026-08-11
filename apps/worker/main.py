@@ -141,6 +141,8 @@ async def sync_portal(period: str, request_id: UUID | None = None) -> UUID | Non
                                 )
                             )
                             old_hash = existing.content_hash if existing else None
+                            if existing is None or not existing.authors or not existing.attachments:
+                                record = await client.enrich_expedient(http_client, record)
                             persist_expedient(session, record)
                             if existing is None:
                                 created += 1

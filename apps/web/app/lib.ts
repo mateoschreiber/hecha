@@ -1,4 +1,4 @@
-export type Expedient = { id:string; source_id:string; number?:string; title:string; type?:string; chamber?:string; status?:string; stage?:string; filed_on?:string; synced_at?:string; source_url?:string; authors?:{name:string;party?:string}[]; attachments?:{id:string;url?:string;info?:string}[]; committees?:string[] };
+export type Expedient = { id:string; source_id:string; number?:string; title:string; type?:string; chamber?:string; status?:string; stage?:string; filed_on?:string; synced_at?:string; source_url?:string; authors?:{name:string;party?:string;chamber?:string}[]; attachments?:{id:string;url?:string;info?:string}[]; committees?:string[] };
 export type Freshness = { expedients?:string; count:number; state:"fresh"|"stale"|"empty"; last_success_at?:string; last_error_at?:string; last_error?:string };
 export type Distribution = {label:string;count:number};
 export type Dashboard = {kpis:{total:number;in_progress:number};by_chamber:Distribution[];by_status:Distribution[];by_type:Distribution[];evolution:{month:string;count:number}[];recent:Expedient[]};
